@@ -1,0 +1,15 @@
+# Core
+pyyaml>=6.0
+
+# L2 classifier (recommended; without it untrusted content fails closed)
+torch>=2.2
+transformers>=4.40
+
+# L3 LLM judge (optional)
+litellm>=1.40
+
+# PDF extraction (optional, needed for application/pdf ingest)
+pymupdf>=1.24
+
+# Tests
+pytest>=8.0

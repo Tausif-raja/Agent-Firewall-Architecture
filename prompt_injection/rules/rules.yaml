@@ -1,0 +1,148 @@
+# L1 injection signatures.
+#
+# Fields:
+#   id          stable identifier, logged with every hit
+#   pattern     Python regex, matched case-insensitively against L0-normalized text
+#   weight      0..1 contribution to rule_score (combined as 1 - prod(1 - w))
+#   scope       "all"       -> applies to every segment
+#               "untrusted" -> only to SEMI / UNTRUSTED content (phrasing that is
+#                              normal from a user but alarming inside a document)
+#   block_below optional Trust name; a hit on content with trust BELOW this level
+#               is a high-confidence detection that short-circuits to block
+#
+# Keep patterns tight. Bare keywords like "password" or "api" belong in the
+# PII / content-safety stages, not here. Every change must pass the
+# hard-negative tests in tests/prompt_injection/test_rules.py.
+
+version: 1
+
+rules:
+  # --- Instruction override --------------------------------------------------
+  - id: override.ignore_previous
+    pattern: >-
+      \b(ignore|disregard|forget|skip|bypass|override|neglect)\b[\s\w,'"-]{0,40}?\b(previous|prior|above|earlier|preceding|foregoing|all|any|your|the|system|original)\b[\s\w,'"-]{0,30}?\b(instructions?|prompts?|rules|directions|directives|guidelines|guardrails|constraints|context|programming)\b
+    weight: 0.8
+    scope: all
+    block_below: USER
+
+  - id: override.new_instructions
+    pattern: >-
+      \b(new|updated|real|actual|true|revised|important)\s+(system\s+)?(instructions?|directives?|task)\s*[:\-]
+    weight: 0.5
+    scope: all
+
+  - id: override.from_now_on
+    pattern: >-
+      \b(from\s+now\s+on|for\s+the\s+rest\s+of\s+(this|the)\s+conversation)\b[\s\w,]{0,20}\byou\s+(will|must|shall|are)\b
+    weight: 0.5
+    scope: all
+
+  # --- Role hijacking / jailbreak framing -------------------------------------
+  - id: role.you_are_now
+    pattern: >-
+      \byou\s+are\s+(now|no\s+longer)\b
+    weight: 0.45
+    scope: all
+
+  - id: role.special_mode
+    pattern: >-
+      \b(developer|god|jailbreak|unrestricted|unfiltered|dan|sudo|debug\s+admin)\s+mode\b
+    weight: 0.7
+    scope: all
+
+  - id: role.dan
+    pattern: >-
+      \bdo\s+anything\s+now\b
+    weight: 0.75
+    scope: all
+
+  - id: role.no_restrictions
+    pattern: >-
+      \b(without|free\s+of|no)\s+(any\s+)?(restrictions|limitations|filters|guidelines|safety\s+(rules|guidelines|filters))\b
+    weight: 0.35
+    scope: all
+
+  # --- System prompt extraction ----------------------------------------------
+  - id: probe.system_prompt
+    pattern: >-
+      \b(reveal|print|show|repeat|output|display|leak|dump|tell\s+me|what\s+(is|are|was|were))\b[\s\w]{0,20}?\b(system|initial|hidden|original|secret|developer)\s+(prompt|instructions?|message|rules)
+    weight: 0.65
+    scope: all
+
+  - id: probe.repeat_above
+    pattern: >-
+      \b(repeat|print|output|copy)\s+(everything|all|the\s+(words|text|content))\s+(above|before\s+this)\b
+    weight: 0.6
+    scope: all
+
+  # --- Forged structure ------------------------------------------------------
+  - id: forge.chat_template_tokens
+    pattern: >-
+      <\|im_start\|>|<\|im_end\|>|<\|start_header_id\|>|<\|end_header_id\|>|<\|eot_id\|>|<\|endoftext\|>|<\|system\|>|<\|assistant\|>|\[/?INST\]|<</?SYS>>
+    weight: 0.9
+    scope: all
+    block_below: USER
+
+  - id: forge.role_header
+    pattern: >-
+      (?m)^\s*(\#{1,4}\s*|\*\*)?(system|assistant|developer)\s*(\*\*)?\s*:
+    weight: 0.4
+    scope: untrusted
+
+  - id: forge.xml_role_tags
+    pattern: >-
+      </?(system|instructions?|system_prompt|admin)>
+    weight: 0.5
+    scope: all
+
+  - id: forge.end_of_data
+    pattern: >-
+      \b(end\s+of\s+(document|data|context|content|input)|</?untrusted_content)\b
+    weight: 0.5
+    scope: untrusted
+
+  # --- Text addressed to the model (alarming inside documents) ----------------
+  - id: indirect.note_to_ai
+    pattern: >-
+      \b(note|message|instructions?|reminder|directive)\s+(to|for)\s+(the\s+)?(ai|assistant|llm|model|agent|chatbot|language\s+model|copilot)\b
+    weight: 0.6
+    scope: untrusted
+    block_below: SEMI
+
+  - id: indirect.if_you_are_ai
+    pattern: >-
+      \bif\s+you\s+are\s+(an?\s+)?(ai|llm|large\s+language\s+model|language\s+model|assistant|chatbot|agent)\b
+    weight: 0.7
+    scope: untrusted
+    block_below: SEMI
+
+  - id: indirect.vocative_command
+    pattern: >-
+      \b(ai|assistant|llm|chatgpt|claude|gpt|gemini|copilot|agent)\s*[,:]\s*(please\s+)?(ignore|send|forward|email|delete|execute|run|visit|open|click|navigate|fetch|call|transfer|do\s+not|don'?t)\b
+    weight: 0.6
+    scope: untrusted
+
+  - id: indirect.hide_from_user
+    pattern: >-
+      \b(do\s+not|don'?t|never|without)\s+(tell|telling|inform|informing|mention|mentioning|reveal|revealing|show|showing|notify|notifying|alert|alerting)\b[\s\w]{0,20}?\b(the\s+)?user\b
+    weight: 0.7
+    scope: all
+
+  # --- Exfiltration staging --------------------------------------------------
+  - id: exfil.markdown_image_with_query
+    pattern: >-
+      !\[[^\]]*\]\(\s*https?://[^)\s]+\?[^)\s]*=
+    weight: 0.4
+    scope: untrusted
+
+  - id: exfil.send_to_address
+    pattern: >-
+      \b(send|forward|email|e-mail|post|upload|exfiltrate|transmit)\b[\s\w,]{0,40}\bto\s+[\w.+-]+@[\w-]+\.[\w.]+
+    weight: 0.5
+    scope: untrusted
+
+  - id: exfil.append_secrets_to_url
+    pattern: >-
+      \b(append|include|add|encode|put)\b[\s\w]{0,40}\b(to|in|into)\s+(the\s+)?(url|link|query\s+string|image\s+(url|link))\b
+    weight: 0.6
+    scope: all

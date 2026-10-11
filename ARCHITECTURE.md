@@ -5,10 +5,16 @@ The Agent Firewall acts as a robust middleware layer positioned between the user
 
 ## Core Components
 
-1. **Prompt Injection Detection & Prevention**
-   - Intercepts incoming user prompts before they reach the LLM.
-   - Evaluates prompts for malicious intent, jailbreak attempts, or unauthorized command injections.
-   - *(Note: Specific technologies or models to be determined—e.g., heuristic filters, secondary LLM evaluation, or specialized classifier models).*
+1. **Prompt Injection Detection & Prevention** (full design: [docs/PROMPT_INJECTION.md](docs/PROMPT_INJECTION.md))
+   - **Scope:** direct injection (user messages) **and** indirect injection (PDFs, web pages, RAG chunks, tool responses, sub-agent messages).
+   - **Provenance:** all content is handled as labeled segments with a trust level (`SYSTEM` > `USER` > `SEMI` > `UNTRUSTED`). The trust level comes from how the content arrived, never from what it says.
+   - **Detection cascade:**
+     - **L0 Normalize:** Unicode/homoglyph/zero-width cleanup, decoding of encoded payloads.
+     - **L1 Rules:** versioned signatures for low-cost known attacks.
+     - **L2 Classifier:** a fine-tuned transformer (Llama Prompt Guard 2 / DeBERTa-v3 prompt-injection), the primary detector.
+     - **L3 LLM judge:** a hardened judge that only sees gray-zone cases.
+   - **Indirect defenses:** format-aware extractors that surface hidden text, scanning at ingest and on every tool result, spotlighting of untrusted content in the prompt, **session taint tracking with tool-call capability control**, and egress exfiltration checks.
+   - Detection lowers the attack rate. Capability control limits the damage when detection misses.
 
 2. **Agent Loop Management (Infinite Loop Prevention)**
    - Monitors the reasoning and action loops of AI agents.
@@ -31,9 +37,12 @@ The Agent Firewall acts as a robust middleware layer positioned between the user
    - Prompt Injection Detection analyzes the prompt for malicious instructions.
    - If a threat is detected, the request is blocked or sanitized.
 3. **LLM/Agent Processing:** The safe prompt is passed to the LLM/Agent.
+   - Retrieved documents, uploads, web content, and tool results are scanned before entering context and wrapped as untrusted data.
+   - Once untrusted content is in context, the session is tainted. Privileged tool calls are checked against capability policy and argument provenance, or require human approval.
 4. **Agent Monitoring (Firewall):**
    - As the agent reasons (Chain of Thought), the firewall embeds and compares consecutive reasoning outputs.
    - Halts the agent if an infinite or unproductive loop is detected.
 5. **Egress Filtering (Firewall):**
    - The final response is scanned again for PII or other sensitive content before being released.
+   - Exfiltration channels are neutralized: markdown images/links to non-allowlisted domains, and system-prompt canary token leaks.
 6. **User Output:** The safe, filtered response is delivered to the user.
