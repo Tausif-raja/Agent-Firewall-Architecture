@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 class Define_Agent():
     def __init__(self):
-        self.api_key = "***REMOVED_GROQ_KEY***"
+        self.api_key = os.getenv("OPENROUTER_KEY") or os.getenv("OPENROUTER_API_KEY")
 
     # def call(self, 
     #          model_name:str,
@@ -23,7 +23,7 @@ class Define_Agent():
     #     )
     #     return response
 
-    def chat(self, user_id: str, messages: list, model: str = "groq/llama-3.1-8b-instant", db: Session = get_db(), **kwargs):
+    def chat(self, user_id: str, messages: list, model: str = "openrouter/openai/gpt-4o-mini", db: Session = get_db(), **kwargs):
         """
         The Main Entry Point.
         Accepts generic parameters (**kwargs) to support various LLMs.

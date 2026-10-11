@@ -1,14 +1,30 @@
 import os
+import logging
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
 
-# Default to a local postgres instance. 
-# Ideally, this should be loaded from environment variables.
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres.ohxeuvvhflkfugiakbul:***REMOVED_SUPABASE_ENV_VALUE***@aws-1-ap-northeast-2.pooler.supabase.com:6543/postgres")
+logger = logging.getLogger("agent_firewall.database")
 
-engine = create_engine(DATABASE_URL)
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    supabase_pw = os.getenv("SUPABASE", "")
+    # Check if a custom valid URL is set, else default to local sqlite
+    DATABASE_URL = "sqlite:///./agent_firewall.db"
+
+try:
+    if DATABASE_URL.startswith("postgresql"):
+        engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+        # Test connection
+        with engine.connect() as conn:
+            pass
+    else:
+        engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {})
+except Exception as e:
+    logger.warning(f"Could not connect to {DATABASE_URL}: {e}. Falling back to SQLite local database.")
+    DATABASE_URL = "sqlite:///./agent_firewall.db"
+    engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-
 Base = declarative_base()
 
 def get_db():
@@ -18,3 +34,4 @@ def get_db():
         yield db
     finally:
         db.close()
+
