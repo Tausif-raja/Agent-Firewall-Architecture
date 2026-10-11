@@ -1,7 +1,11 @@
 from litellm import completion
 import os
 
-os.environ['GROQ_API_KEY'] = "***REMOVED_GROQ_KEY***"
+from pathlib import Path
+from dotenv import load_dotenv
+
+# Keys live in Agent_Firewall/.env (never commit them). See .env.example.
+load_dotenv(Path(__file__).resolve().parents[1] / "Agent_Firewall" / ".env")
 response = completion(
     model="groq/openai/gpt-oss-20b", 
     messages=[

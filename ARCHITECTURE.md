@@ -16,33 +16,37 @@ The Agent Firewall acts as a robust middleware layer positioned between the user
    - **Indirect defenses:** format-aware extractors that surface hidden text, scanning at ingest and on every tool result, spotlighting of untrusted content in the prompt, **session taint tracking with tool-call capability control**, and egress exfiltration checks.
    - Detection lowers the attack rate. Capability control limits the damage when detection misses.
 
-2. **Agent Loop Management (Infinite Loop Prevention)**
-   - Monitors the reasoning and action loops of AI agents.
-   - Compares successive reasoning tokens or states to determine if actual progress is being made.
-   - Uses **Embeddings** to compare reasoning tokens from one step to the next. If the semantic similarity is too high over multiple steps (indicating repetitive thought processes without progression), the firewall intercepts and halts the unnecessary looping.
+2. **Agent Loop Management (Kill-Switch)** (`Agent_Firewall/firewall_engine.py`)
+   - Fingerprints every reply as *text + proposed tool calls* and keeps a short history per **API key + session**, so tenants never share state.
+   - **Layer A:** the same fingerprint three times in a row (identical text, or the same tool with the same arguments) terminates the loop.
+   - **Layer B:** near-identical text replies across four turns. This applies to text only: calling the same tool with *different* arguments (e.g. iterating over a list) is progress, not a loop.
+   - *Why not embeddings of reasoning:* tested on the project's own demo data, MiniLM similarity missed the stuck loop (max 0.87 < 0.96 threshold) and flagged a legitimate batch job. Reasoning tokens are also often hidden by providers.
 
-3. **Private Data (PII) Detection & Redaction**
-   - Scans both incoming prompts and outgoing LLM responses for sensitive personal data.
-   - Utilizes tools like **Microsoft PII detection (e.g., Microsoft Presidio)** to identify and mask/redact sensitive information.
-   - Protects against accidental data leaks and exfiltration vulnerabilities.
+3. **Sensitive Data, PII & GDPR** (`firewall/sensitive_data_engine.py`)
+   - Detects credentials (provider API keys, passwords, connection strings), PII (email, phone, Luhn-valid cards, IBAN, SSN, IP) and GDPR Art. 9 special categories; Presidio is used additionally when installed.
+   - Per-key mode: **tokenize** (reversible per-session vault; values restored for the sender), **mask**, or **block**. Credentials are always masked irreversibly.
+   - Applies to every text part of the latest user message (including multimodal content). Replies never echo credentials. The audit log stores redacted text only.
 
-4. **Vulnerability Mitigation**
-   - Acts as a general shield against various known vulnerabilities in AI agents.
-   - Ensures that the agent stays within its defined operational boundaries.
+4. **Tool Guard** (`firewall/tool_guard.py`)
+   - **Gate 1:** allowlist, roles, argument validation, destructive-operation patterns (`DROP TABLE`, `rm -rf`, …), human approval for high-risk tools.
+   - **Execution:** timeout. **Gate 2:** credentials stripped from tool output, output truncated.
+   - Tool calls *proposed by the model* are screened before they reach the client agent: destructive arguments and destinations taken from untrusted content are dropped.
 
-## Architecture Flow (Middle-ware Instance)
-1. **User Input:** User submits a prompt.
-2. **Ingress Filtering (Firewall):**
-   - PII Detection scans and masks private data.
-   - Prompt Injection Detection analyzes the prompt for malicious instructions.
-   - If a threat is detected, the request is blocked or sanitized.
-3. **LLM/Agent Processing:** The safe prompt is passed to the LLM/Agent.
-   - Retrieved documents, uploads, web content, and tool results are scanned before entering context and wrapped as untrusted data.
-   - Once untrusted content is in context, the session is tainted. Privileged tool calls are checked against capability policy and argument provenance, or require human approval.
-4. **Agent Monitoring (Firewall):**
-   - As the agent reasons (Chain of Thought), the firewall embeds and compares consecutive reasoning outputs.
-   - Halts the agent if an infinite or unproductive loop is detected.
-5. **Egress Filtering (Firewall):**
-   - The final response is scanned again for PII or other sensitive content before being released.
-   - Exfiltration channels are neutralized: markdown images/links to non-allowlisted domains, and system-prompt canary token leaks.
-6. **User Output:** The safe, filtered response is delivered to the user.
+5. **Access Control** (`Agent_Firewall/main.py`, `Agent_Firewall/security.py`)
+   - Agents authenticate with virtual keys (`agf-live-…`), stored only as SHA-256 hashes, each with its own model, protection policy and per-minute rate limit.
+   - Dashboard and management APIs require an admin token. CORS is same-origin unless configured.
+
+## Request Flow (`POST /api/v1/chat/completions`)
+1. **Authenticate** the virtual key → 401. **Rate limit** → 429.
+2. **Sensitive data:** tokenize/mask/block PII and credentials in the latest user message.
+3. **Direct injection:** rule check on the latest user message → 403.
+4. **Indirect injection:** every `role: "tool"` message is scanned as untrusted (rules, plus the ML classifier when installed). Injections are removed, other content is wrapped as data, and the model is told not to follow it. The session is marked tainted.
+5. **LLM call** via LiteLLM, with `tools`/`tool_choice` forwarded. Upstream failures return 502 and are logged as failures.
+6. **Tool-call gate:** screen the model's proposed tool calls (destructive arguments, argument provenance in tainted sessions).
+7. **Kill-switch** on text + tool-call fingerprint.
+8. **Egress:** credentials redacted. In tainted sessions, external images and model-composed links are removed (exfiltration channels).
+9. **Audit log** (redacted), then the response is returned as JSON or replayed as SSE when `stream=true`.
+
+## Deployment Notes
+- Single worker: rate limits, loop history and the token vault are in-process memory.
+- Default storage is SQLite at `Agent_Firewall/agent_firewall.db`; set `DATABASE_URL` for Postgres.

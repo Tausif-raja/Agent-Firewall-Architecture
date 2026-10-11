@@ -4,6 +4,9 @@ import time
 import uuid
 import json
 import logging
+import threading
+import importlib.util
+from collections import OrderedDict
 from datetime import datetime, date
 from typing import Dict, Any, List, Optional, Tuple
 
@@ -34,8 +37,71 @@ from firewall.tool_guard import (
     ToolExecutionResult,
 )
 from firewall.sensitive_data_engine import sensitive_engine, SensitiveFinding
+from Agent_Firewall.database.models import utcnow
+from Agent_Firewall.security import hash_api_key
+from prompt_injection import spotlight
+from prompt_injection.capabilities import READ, ToolPolicy as CapabilityPolicy
+from prompt_injection.classifier import HFInjectionClassifier, NullClassifier
+from prompt_injection.guard import InjectionGuard
+from prompt_injection.policy import PolicyConfig
+from prompt_injection.segment import Action, Channel, Decision, Segment, SessionContext, Trust
+from prompt_injection.segment import ToolCall as GuardToolCall
 
 logger = logging.getLogger("agent_firewall.engine")
+
+MAX_TRACKED_SESSIONS = 10_000   # kill-switch memory bound
+LOOP_HISTORY_WINDOW = 20
+UPSTREAM_AUTH_ERRORS = ("api key", "expired", "401", "authentication", "unauthorized", "forbidden", "403")
+
+
+def _message_text(content: Any) -> str:
+    if isinstance(content, list):
+        return " ".join(p.get("text", "") for p in content if isinstance(p, dict))
+    return "" if content is None else str(content)
+
+
+def _tool_call_to_dict(tc: Any) -> Dict[str, Any]:
+    if hasattr(tc, "model_dump"):
+        d = tc.model_dump()
+    elif isinstance(tc, dict):
+        d = dict(tc)
+    else:
+        d = dict(vars(tc))
+    fn = d.get("function") or {}
+    if not isinstance(fn, dict):
+        fn = fn.model_dump() if hasattr(fn, "model_dump") else dict(vars(fn))
+    return {"id": d.get("id"), "type": d.get("type") or "function",
+            "function": {"name": fn.get("name") or "", "arguments": fn.get("arguments") or "{}"}}
+
+
+def _parse_args(raw: Any) -> Dict[str, Any]:
+    if isinstance(raw, dict):
+        return raw
+    try:
+        parsed = json.loads(raw or "{}")
+    except (TypeError, ValueError):
+        return {"_raw": str(raw)}
+    return parsed if isinstance(parsed, dict) else {"value": parsed}
+
+
+def _build_injection_guard(tool_guard: ToolSecurityGuard) -> InjectionGuard:
+    """Injection guard for tool results and proposed tool calls.
+
+    INJECTION_CLASSIFIER=auto (default) uses the Hugging Face classifier when
+    transformers+torch are installed; otherwise it runs on rules only.
+    """
+    mode = os.getenv("INJECTION_CLASSIFIER", "auto").strip().lower()
+    hf_available = all(importlib.util.find_spec(m) for m in ("transformers", "torch"))
+    cfg = PolicyConfig()
+    if mode == "none" or (mode == "auto" and not hf_available):
+        classifier = NullClassifier()
+        cfg.classifier_fail_mode = {t: "rules_only" for t in cfg.classifier_fail_mode}
+        logger.warning("Injection classifier disabled (INJECTION_CLASSIFIER=%s, transformers/torch installed=%s): "
+                       "tool results are screened by rules only", mode, hf_available)
+    else:
+        classifier = HFInjectionClassifier()
+    read_only = {name: READ for name, pol in tool_guard.policies.items() if pol.risk_level == "low" and not pol.blocked}
+    return InjectionGuard(classifier=classifier, config=cfg, tool_policy=CapabilityPolicy(risks=read_only))
 
 # -------------------------------------------------------------
 # Direct Patterns for Prompt Injection & Harmful Instructions
@@ -94,9 +160,12 @@ class FirewallCoreEngine:
     def __init__(self):
         self.tool_guard = ToolSecurityGuard()
         self.sensitive_engine = sensitive_engine
-        self.session_histories: Dict[str, List[str]] = {}
+        self.injection_guard = _build_injection_guard(self.tool_guard)
+        # Keyed by "<tenant>:<session>" so clients can never collide; bounded LRU.
+        self.session_histories: "OrderedDict[str, List[str]]" = OrderedDict()
+        self._history_lock = threading.Lock()
 
-    def inspect_prompt(self, prompt: str) -> IngressSecurityResult:
+    def inspect_prompt(self, prompt: str, check_sensitive: bool = True) -> IngressSecurityResult:
         """
         Ingress Firewall: Scans prompt against direct injection, harmful commands, jailbreaks,
         and sensitive data/PII (Microsoft Presidio & native secret engines).
@@ -125,7 +194,11 @@ class FirewallCoreEngine:
                     score=0.98
                 )
 
-        # Step 2: Microsoft Presidio & Sensitive Data Guard (Redaction + Unsafe Verdict)
+        # Step 2: Microsoft Presidio & Sensitive Data Guard (Redaction + Unsafe Verdict).
+        # Callers that already ran the sensitive-data stage pass check_sensitive=False;
+        # otherwise PII that was just tokenized would be re-detected and blocked here.
+        if not check_sensitive:
+            return IngressSecurityResult(is_safe=True, verdict="SAFE", score=0.05)
         redacted_text, findings, _ = self.sensitive_engine.sanitize_or_pseudonymize(
             text=cleaned_text,
             session_id="ingress_inspect",
@@ -150,15 +223,24 @@ class FirewallCoreEngine:
 
         return IngressSecurityResult(is_safe=True, verdict="SAFE", score=0.05)
 
-    def check_kill_switch(self, session_id: str, new_response: str) -> Dict[str, Any]:
+    def check_kill_switch(self, session_id: str, new_response: str, fuzzy: bool = True) -> Dict[str, Any]:
         """
         Monitors agent responses to detect and terminate infinite runaway loops.
+        fuzzy=False disables the lexical-prefix layer: for tool calls only exact
+        repetition (same tool, same arguments) counts, since calling the same tool
+        with different arguments is usually progress (e.g. iterating over a list).
         """
         if not session_id:
             session_id = "default"
 
-        history = self.session_histories.setdefault(session_id, [])
-        history.append(new_response)
+        with self._history_lock:
+            history = self.session_histories.setdefault(session_id, [])
+            self.session_histories.move_to_end(session_id)
+            while len(self.session_histories) > MAX_TRACKED_SESSIONS:
+                self.session_histories.popitem(last=False)
+            history.append(new_response)
+            del history[:-LOOP_HISTORY_WINDOW]
+            history = list(history)
 
         # Layer A: Exact match loop detection over window of 3
         if len(history) >= 3:
@@ -171,7 +253,7 @@ class FirewallCoreEngine:
                 }
 
         # Layer B: Near-identical repetition (substring containment or simple lexical similarity)
-        if len(history) >= 4:
+        if fuzzy and len(history) >= 4:
             recent = history[-4:]
             if len(recent[0]) > 20 and all(r == recent[0] or (len(r) > 15 and r[:30] == recent[0][:30]) for r in recent):
                 return {
@@ -183,8 +265,76 @@ class FirewallCoreEngine:
         return {"loop_detected": False, "layer": None, "reason": "OK"}
 
     def reset_session(self, session_id: str):
-        if session_id in self.session_histories:
-            self.session_histories[session_id] = []
+        with self._history_lock:
+            self.session_histories.pop(session_id, None)
+
+    def _sanitize_content(self, content: Any, scope: str, mode: str):
+        """Sanitize a message's content, string or multimodal list (each text part separately).
+
+        Returns (joined_sanitized_text, findings, should_block, new_content).
+        """
+        if isinstance(content, list):
+            new_parts, texts, findings, block = [], [], [], False
+            for part in content:
+                if isinstance(part, dict) and isinstance(part.get("text"), str):
+                    clean, f, b = self.sensitive_engine.sanitize_or_pseudonymize(text=part["text"], session_id=scope, mode=mode)
+                    part = {**part, "text": clean}
+                    findings += f
+                    block = block or b
+                    texts.append(clean)
+                new_parts.append(part)
+            return " ".join(texts), findings, block, new_parts
+        clean, findings, block = self.sensitive_engine.sanitize_or_pseudonymize(text=_message_text(content), session_id=scope, mode=mode)
+        return clean, findings, block, clean
+
+    # ------------------------------------------------------------------
+    # Indirect injection: tool results in, tool calls out
+    # ------------------------------------------------------------------
+    def _screen_tool_messages(self, messages: List[Dict[str, Any]], ctx: SessionContext):
+        """Scan role=tool messages as untrusted content; wrap or remove them before the LLM sees them."""
+        idx = [i for i, m in enumerate(messages) if m.get("role") in ("tool", "function")]
+        if not idx:
+            return messages, []
+        segments = [
+            Segment(_message_text(messages[i].get("content")),
+                    f"tool:{messages[i].get('name') or messages[i].get('tool_call_id') or 'unknown'}",
+                    Trust.UNTRUSTED, Channel.TOOL_RESULT)
+            for i in idx
+        ]
+        verdicts = self.injection_guard.scan_many(segments, ctx)
+        out = [dict(m) for m in messages]
+        findings = []
+        for i, seg, v in zip(idx, segments, verdicts):
+            out[i]["content"] = self.injection_guard.wrap(seg, ctx, v)
+            if v.action is not Action.ALLOW:
+                findings.append({"source": seg.source, "action": v.action.value, "label": v.label.value,
+                                 "score": round(v.score, 3), "reasons": v.reasons[:5]})
+
+        # Tell the model that wrapped content is data, not instructions.
+        rule = spotlight.system_rule(ctx)
+        if out and out[0].get("role") == "system" and isinstance(out[0].get("content"), str):
+            out[0]["content"] = f"{out[0]['content']}\n\n{rule}"
+        else:
+            out.insert(0, {"role": "system", "content": rule})
+        return out, findings
+
+    def _screen_tool_calls(self, raw_calls: List[Any], ctx: SessionContext):
+        """Gate the model's proposed tool calls before the client agent executes them."""
+        kept, blocked = [], []
+        for tc in raw_calls:
+            call = _tool_call_to_dict(tc)
+            name = call["function"]["name"]
+            args = _parse_args(call["function"]["arguments"])
+            reason = self.tool_guard.screen_proposed_call(name, args)
+            if reason is None:
+                decision = self.injection_guard.authorize_tool_call(GuardToolCall(name, args), ctx)
+                if decision.decision is not Decision.ALLOW:
+                    reason = f"{decision.decision.value}: {decision.reason}"
+            if reason:
+                blocked.append({"tool": name, "reason": reason})
+            else:
+                kept.append(call)
+        return kept, blocked
 
     def execute_tool_proxy(
         self,
@@ -287,7 +437,7 @@ class FirewallCoreEngine:
                 latency_ms=latency,
                 estimated_tokens=tokens,
                 output_snippet=snippet,
-                timestamp=datetime.utcnow()
+                timestamp=utcnow()
             )
             db.add(log_entry)
             db.commit()
@@ -304,6 +454,7 @@ class FirewallCoreEngine:
         firewall_key: Optional[str] = None,
         session_id: Optional[str] = None,
         db: Optional[Session] = None,
+        tenant_id: Optional[str] = None,
         **kwargs
     ) -> Dict[str, Any]:
         """
@@ -320,7 +471,9 @@ class FirewallCoreEngine:
             close_session = True
 
         req_id = str(uuid.uuid4())
-        session_id = session_id or user_id or "default_session"
+        session_id = session_id or "default_session"
+        # Per-tenant scope: the same session_id from two API keys never shares state.
+        scope = f"{tenant_id or user_id or 'anonymous'}:{session_id}"
 
         # Extract last user message
         last_user_prompt = ""
@@ -341,7 +494,7 @@ class FirewallCoreEngine:
         gdpr_mode = "tokenize"
 
         if firewall_key:
-            key_cfg = db.query(ApiKeyConfig).filter(ApiKeyConfig.api_key == firewall_key).first()
+            key_cfg = db.query(ApiKeyConfig).filter(ApiKeyConfig.api_key == hash_api_key(firewall_key)).first()
             if key_cfg:
                 prompt_injection_active = bool(key_cfg.prompt_injection_enabled)
                 kill_switch_active = bool(key_cfg.kill_switch_enabled)
@@ -354,12 +507,12 @@ class FirewallCoreEngine:
 
         # Step 0: Ingress Sensitive Data & GDPR Protection (Secrets, PII, Article 9 Special Categories)
         sensitive_findings = []
+        sanitized_prompt = last_user_prompt
         effective_messages = messages
+        last_user_idx = max((i for i, m in enumerate(messages) if m.get("role") == "user"), default=None)
         if sensitive_data_active and last_user_prompt:
-            sanitized_prompt, sensitive_findings, should_block = self.sensitive_engine.sanitize_or_pseudonymize(
-                text=last_user_prompt,
-                session_id=session_id,
-                mode=gdpr_mode
+            sanitized_prompt, sensitive_findings, should_block, sanitized_content = self._sanitize_content(
+                messages[last_user_idx].get("content"), scope, gdpr_mode
             )
 
             if should_block:
@@ -373,7 +526,7 @@ class FirewallCoreEngine:
                     req_id=req_id,
                     user_id=user_id,
                     model=model,
-                    user_query=last_user_prompt,
+                    user_query=sanitized_prompt,
                     bot_response=blocked_response,
                     status="blocked_sensitive_data",
                     latency_ms=latency_ms,
@@ -399,18 +552,13 @@ class FirewallCoreEngine:
                 }
 
             # Update messages payload with pseudonymized text if modified
-            if sanitized_prompt != last_user_prompt:
-                effective_messages = []
-                for m in messages:
-                    if m.get("role") == "user" and m.get("content") == last_user_prompt:
-                        m_copy = dict(m)
-                        m_copy["content"] = sanitized_prompt
-                        effective_messages.append(m_copy)
-                    else:
-                        effective_messages.append(m)
+            if sensitive_findings:
+                effective_messages = list(messages)
+                effective_messages[last_user_idx] = {**messages[last_user_idx], "content": sanitized_content}
 
         # Step 1: Prompt Injection Check
-        ingress_result = self.inspect_prompt(last_user_prompt) if prompt_injection_active else IngressSecurityResult(is_safe=True)
+        ingress_result = (self.inspect_prompt(last_user_prompt, check_sensitive=False)
+                          if prompt_injection_active else IngressSecurityResult(is_safe=True))
 
         if not ingress_result.is_safe:
             end_time = time.time()
@@ -447,47 +595,79 @@ class FirewallCoreEngine:
                 }
             }
 
+        # Step 1b: Indirect injection. Tool results are untrusted content.
+        guard_ctx = SessionContext(session_id=scope)
+        for m in effective_messages:
+            if m.get("role") == "user":
+                text = _message_text(m.get("content"))
+                guard_ctx.user_texts.append(text)
+                guard_ctx.user_task = guard_ctx.user_task or text
+        tool_message_findings: List[Dict[str, Any]] = []
+        if prompt_injection_active:
+            effective_messages, tool_message_findings = self._screen_tool_messages(effective_messages, guard_ctx)
+
         # Step 2: Route & Execute Completion
-        # Determine API Key for LiteLLM (Prioritize OpenRouter backend key)
         call_api_key = (
             api_key
             or os.getenv("OPENROUTER_KEY")
             or os.getenv("OPENROUTER_API_KEY")
             or os.getenv("GROQ_API_KEY")
         )
+        target_model = model or "openrouter/openai/gpt-4o-mini"
+        if not target_model.startswith(("openrouter/", "groq/", "openai/", "anthropic/")):
+            target_model = f"openrouter/{target_model}"
 
         try:
-            # Clean model name if necessary
-            target_model = model or "openrouter/openai/gpt-4o-mini"
-            if not target_model.startswith("openrouter/") and not target_model.startswith("groq/") and not target_model.startswith("openai/") and not target_model.startswith("anthropic/"):
-                target_model = f"openrouter/{target_model}"
+            try:
+                completion_res = completion(
+                    model=target_model,
+                    messages=effective_messages,
+                    api_key=call_api_key,
+                    **kwargs
+                )
+            except Exception as e:
+                return self._upstream_error(db, req_id, user_id, target_model, last_user_prompt,
+                                            sensitive_findings, sanitized_prompt if sensitive_findings else None,
+                                            e, start_time)
 
-            completion_res = completion(
-                model=target_model,
-                messages=effective_messages,
-                api_key=call_api_key,
-                **kwargs
-            )
-            end_time = time.time()
-            latency_ms = (end_time - start_time) * 1000.0
+            latency_ms = (time.time() - start_time) * 1000.0
+            choice = completion_res.choices[0] if getattr(completion_res, "choices", None) else None
+            message = choice.message if choice is not None else None
+            bot_text = (getattr(message, "content", None) or "") if message is not None else ""
+            raw_calls = list(getattr(message, "tool_calls", None) or []) if message is not None else []
+            finish_reason = getattr(choice, "finish_reason", None) or "stop"
 
-            # Extract response text
-            bot_text = ""
-            if hasattr(completion_res, "choices") and len(completion_res.choices) > 0:
-                bot_text = completion_res.choices[0].message.content or ""
-            elif isinstance(completion_res, dict) and "choices" in completion_res:
-                bot_text = completion_res["choices"][0]["message"]["content"] or ""
+            # Step 2b: Gate the model's proposed tool calls
+            if tool_guard_active and raw_calls:
+                kept_calls, blocked_calls = self._screen_tool_calls(raw_calls, guard_ctx)
+            else:
+                kept_calls, blocked_calls = [_tool_call_to_dict(tc) for tc in raw_calls], []
+            if blocked_calls:
+                logger.warning(f"🚫 [Agent Firewall Tool Gate]: blocked {blocked_calls}")
+                if not kept_calls:
+                    finish_reason = "stop"
+                    note = "; ".join(f"{b['tool']} ({b['reason']})" for b in blocked_calls)
+                    bot_text = (bot_text + "\n\n" if bot_text else "") + f"🛡️ [Agent Firewall]: Tool call(s) blocked: {note}"
 
-            # Step 3: Loop Detector / Kill Switch
+            # Step 3: Loop Detector / Kill Switch (text + tool calls, per tenant session)
+            status = "success"
             if kill_switch_active:
-                loop_check = self.check_kill_switch(session_id, bot_text)
+                fingerprint = bot_text + "|" + json.dumps(
+                    [(c["function"]["name"], c["function"]["arguments"]) for c in kept_calls], sort_keys=True)
+                loop_check = self.check_kill_switch(scope, fingerprint, fuzzy=not kept_calls)
                 if loop_check.get("loop_detected"):
                     bot_text = f"🛑 [Agent Firewall Kill-Switch]: Terminated response loop. Layer {loop_check['layer']} triggered: {loop_check['reason']}"
+                    kept_calls, finish_reason = [], "stop"
                     status = "blocked_loop"
-                else:
-                    status = "success"
-            else:
-                status = "success"
+
+            # Step 3b: Egress. Never echo credentials. When untrusted tool content was in
+            # context, also strip exfiltration channels (external images, data-carrying links).
+            bot_text, leaked = self.sensitive_engine.redact_secrets(bot_text)
+            egress_findings: List[str] = [f"credentials_redacted:{leaked}"] if leaked else []
+            if guard_ctx.tainted and bot_text:
+                egress = self.injection_guard.check_output(bot_text, guard_ctx)
+                bot_text = egress.text
+                egress_findings += egress.findings
 
             # Step 4: Token and Cost Calculations
             input_tokens = 0
@@ -495,22 +675,17 @@ class FirewallCoreEngine:
             if hasattr(completion_res, "usage") and completion_res.usage:
                 input_tokens = getattr(completion_res.usage, "prompt_tokens", 0) or 0
                 output_tokens = getattr(completion_res.usage, "completion_tokens", 0) or 0
-            elif isinstance(completion_res, dict) and "usage" in completion_res:
-                input_tokens = completion_res["usage"].get("prompt_tokens", 0) or 0
-                output_tokens = completion_res["usage"].get("completion_tokens", 0) or 0
 
             cost = 0.0
             try:
-                # LiteLLM cost_calculator supports base model names (e.g. gpt-4o-mini, claude-3.5-sonnet)
                 clean_pricing_model = target_model
                 for pfx in ["openrouter/openai/", "openrouter/anthropic/", "openrouter/google/", "openrouter/meta-llama/", "openrouter/"]:
                     if clean_pricing_model.startswith(pfx):
                         clean_pricing_model = clean_pricing_model[len(pfx):]
                         break
-
                 cost = cost_calculator.completion_cost(completion_response=completion_res, model=clean_pricing_model) or 0.0
             except Exception:
-                # Robust fallback for openrouter models not explicitly in local table
+                # Fallback for OpenRouter models not in LiteLLM's local price table
                 cost = (input_tokens * 0.00000015) + (output_tokens * 0.0000006)
 
             final_status = "UNSAFE" if sensitive_findings else ("SUCCESS" if status == "success" else "LOOP_TERMINATED")
@@ -524,19 +699,42 @@ class FirewallCoreEngine:
                     f"Verdict: UNSAFE | Redacted Items: {[f.to_dict() for f in sensitive_findings]}"
                 )
 
+            logged_calls = "".join(f"\n[tool_call] {c['function']['name']}({c['function']['arguments']})" for c in kept_calls)
             self._log_transaction(
                 db=db,
                 req_id=req_id,
                 user_id=user_id,
                 model=target_model,
                 user_query=sanitized_prompt if (sensitive_findings and sanitized_prompt) else last_user_prompt,
-                bot_response=bot_text,
+                bot_response=bot_text + logged_calls,
                 status=log_status,
                 latency_ms=latency_ms,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 cost=cost
             )
+
+            out_message: Dict[str, Any] = {"role": "assistant", "content": bot_text if (bot_text or not kept_calls) else None}
+            if kept_calls:
+                out_message["tool_calls"] = kept_calls
+            response_body: Dict[str, Any] = {
+                "id": getattr(completion_res, "id", None) or req_id,
+                "object": "chat.completion",
+                "created": getattr(completion_res, "created", None) or int(time.time()),
+                "model": target_model,
+                "choices": [{"index": 0, "message": out_message, "finish_reason": finish_reason}],
+                "usage": {
+                    "prompt_tokens": input_tokens,
+                    "completion_tokens": output_tokens,
+                    "total_tokens": input_tokens + output_tokens
+                }
+            }
+            if blocked_calls or tool_message_findings or egress_findings:
+                response_body["firewall"] = {
+                    "blocked_tool_calls": blocked_calls,
+                    "tool_message_findings": tool_message_findings,
+                    "egress_findings": egress_findings,
+                }
 
             return {
                 "request_id": req_id,
@@ -548,112 +746,50 @@ class FirewallCoreEngine:
                 "redacted_prompt": sanitized_prompt if sensitive_findings else None,
                 "sensitive_findings": [f.to_dict() for f in sensitive_findings],
                 "ropa_record": self.sensitive_engine.generate_ropa_record(sensitive_findings, session_id=session_id) if sensitive_findings else None,
+                "blocked_tool_calls": blocked_calls,
+                "tool_message_findings": tool_message_findings,
                 "tokens": {
                     "input": input_tokens,
                     "output": output_tokens,
                     "total": input_tokens + output_tokens
                 },
                 "cost_usd": round(cost, 6),
-                "response": {
-                    "id": req_id,
-                    "choices": [{
-                        "message": {"role": "assistant", "content": bot_text},
-                        "finish_reason": "stop"
-                    }],
-                    "usage": {
-                        "prompt_tokens": input_tokens,
-                        "completion_tokens": output_tokens,
-                        "total_tokens": input_tokens + output_tokens
-                    }
-                }
-            }
-
-        except Exception as e:
-            end_time = time.time()
-            latency_ms = (end_time - start_time) * 1000.0
-            error_msg = str(e)
-            logger.warning(f"Upstream provider call error: {error_msg}")
-
-            # Check if this was an API key / model deprecation error from upstream
-            if any(err_token in error_msg.lower() for err_token in ["api key", "expired", "401", "authentication", "decommissioned", "not exist", "forbidden"]):
-                # Provide a realistic, safe simulated response showing the firewall in action
-                simulated_reply = (
-                    f"🔒 [Agent Firewall Notice]: Ingress prompt was verified CLEAN and SAFE by the security pipeline.\n"
-                    f"Note: Upstream provider returned: '{error_msg.splitlines()[0][:120]}...'\n\n"
-                    f"To connect to live external models, please enter your personal API key (Groq, OpenAI, or OpenRouter) in the Playground key field.\n"
-                    f"Firewall Pipeline Status: Ingress Checked [OK] | Dual-Gate Tool Guard [READY] | Kill-Switch [ACTIVE]."
-                )
-                input_tokens = len(last_user_prompt.split())
-                output_tokens = len(simulated_reply.split())
-                total_tokens = input_tokens + output_tokens
-                cost = total_tokens * 0.0000002
-
-                self._log_transaction(
-                    db=db,
-                    req_id=req_id,
-                    user_id=user_id,
-                    model=model,
-                    user_query=last_user_prompt,
-                    bot_response=simulated_reply,
-                    status="success",
-                    latency_ms=latency_ms,
-                    input_tokens=input_tokens,
-                    output_tokens=output_tokens,
-                    cost=cost
-                )
-
-                return {
-                    "request_id": req_id,
-                    "status": "SUCCESS",
-                    "pipeline_stage": "Completed (Simulated Fallback)",
-                    "model_used": model,
-                    "latency_ms": round(latency_ms, 2),
-                    "tokens": {
-                        "input": input_tokens,
-                        "output": output_tokens,
-                        "total": total_tokens
-                    },
-                    "cost_usd": round(cost, 6),
-                    "response": {
-                        "id": req_id,
-                        "choices": [{
-                            "message": {"role": "assistant", "content": simulated_reply},
-                            "finish_reason": "stop"
-                        }],
-                        "usage": {
-                            "prompt_tokens": input_tokens,
-                            "completion_tokens": output_tokens,
-                            "total_tokens": total_tokens
-                        }
-                    }
-                }
-
-            # Other unexpected errors
-            self._log_transaction(
-                db=db,
-                req_id=req_id,
-                user_id=user_id,
-                model=model,
-                user_query=last_user_prompt,
-                bot_response=f"Error: {error_msg}",
-                status="failed",
-                latency_ms=latency_ms,
-                input_tokens=len(last_user_prompt.split()),
-                output_tokens=0,
-                cost=0.0
-            )
-
-            return {
-                "request_id": req_id,
-                "status": "ERROR",
-                "error": error_msg,
-                "pipeline_stage": "Model Execution",
-                "latency_ms": round(latency_ms, 2)
+                "response": response_body,
             }
 
         finally:
             if close_session:
                 db.close()
+
+    def _upstream_error(self, db, req_id, user_id, model, user_prompt, sensitive_findings, redacted_prompt, error, start_time):
+        """Report upstream failures as failures. Never as a simulated success."""
+        latency_ms = (time.time() - start_time) * 1000.0
+        first_line = (str(error).splitlines() or [error.__class__.__name__])[0][:300]
+        safe_message, _ = self.sensitive_engine.redact_secrets(first_line)  # provider errors can echo key fragments
+        is_auth = any(t in first_line.lower() for t in UPSTREAM_AUTH_ERRORS)
+        error_type = "upstream_auth_error" if is_auth else "upstream_error"
+        logger.warning(f"Upstream provider call failed ({error_type}): {safe_message}")
+        self._log_transaction(
+            db=db,
+            req_id=req_id,
+            user_id=user_id,
+            model=model,
+            user_query=redacted_prompt if sensitive_findings else user_prompt,
+            bot_response=f"Error ({error_type}): {safe_message}",
+            status=f"failed_{error_type}",
+            latency_ms=latency_ms,
+            input_tokens=0,
+            output_tokens=0,
+            cost=0.0
+        )
+        return {
+            "request_id": req_id,
+            "status": "ERROR",
+            "error_type": error_type,
+            "error": safe_message,
+            "pipeline_stage": "Model Execution",
+            "latency_ms": round(latency_ms, 2)
+        }
 
     def _log_transaction(
         self,
@@ -675,7 +811,7 @@ class FirewallCoreEngine:
                 request_id=req_id,
                 user_id=user_id,
                 model=model,
-                timestamp=datetime.utcnow(),
+                timestamp=utcnow(),
                 latency_ms=latency_ms,
                 status=status
             )

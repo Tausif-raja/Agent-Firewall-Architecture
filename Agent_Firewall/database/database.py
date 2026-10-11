@@ -5,11 +5,11 @@ from sqlalchemy.orm import sessionmaker, declarative_base
 
 logger = logging.getLogger("agent_firewall.database")
 
-DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    supabase_pw = os.getenv("SUPABASE", "")
-    # Check if a custom valid URL is set, else default to local sqlite
-    DATABASE_URL = "sqlite:///./agent_firewall.db"
+# Default SQLite file lives next to the app (Agent_Firewall/agent_firewall.db), not in
+# whatever directory the server happens to be started from.
+DEFAULT_SQLITE_URL = "sqlite:///" + os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "agent_firewall.db"))
+
+DATABASE_URL = os.getenv("DATABASE_URL") or DEFAULT_SQLITE_URL
 
 try:
     if DATABASE_URL.startswith("postgresql"):
@@ -20,8 +20,9 @@ try:
     else:
         engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {})
 except Exception as e:
-    logger.warning(f"Could not connect to {DATABASE_URL}: {e}. Falling back to SQLite local database.")
-    DATABASE_URL = "sqlite:///./agent_firewall.db"
+    logger.error(f"Could not connect to the configured database ({e.__class__.__name__}). "
+                 f"FALLING BACK to local SQLite at {DEFAULT_SQLITE_URL}: data will not reach Postgres.")
+    DATABASE_URL = DEFAULT_SQLITE_URL
     engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)

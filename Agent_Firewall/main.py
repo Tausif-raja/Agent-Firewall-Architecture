@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 import uuid
 import secrets
 from datetime import datetime, date
@@ -18,8 +19,8 @@ if os.getenv("OPENROUTER_KEY") and not os.getenv("OPENROUTER_API_KEY"):
 from fastapi import FastAPI, Depends, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, JSONResponse
-from pydantic import BaseModel
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy.orm import Session
 
 # Add project root to sys.path
@@ -29,7 +30,7 @@ import logging
 
 logger = logging.getLogger("agent_firewall.main")
 
-from Agent_Firewall.database.database import get_db, engine, Base
+from Agent_Firewall.database.database import get_db, engine, Base, SessionLocal
 from Agent_Firewall.database.models import (
     RequestLog,
     ContentLog,
@@ -37,11 +38,43 @@ from Agent_Firewall.database.models import (
     DailyStats,
     ToolExecutionLog,
     ApiKeyConfig,
+    utcnow,
 )
 from Agent_Firewall.firewall_engine import firewall_engine
+from Agent_Firewall.security import RateLimiter, display_key, hash_api_key, migrate_plaintext_keys
 
-# Ensure tables are created
+# Ensure tables are created, and hash any keys stored in plaintext by older versions
 Base.metadata.create_all(bind=engine)
+with SessionLocal() as _db:
+    _migrated = migrate_plaintext_keys(_db, ApiKeyConfig)
+    if _migrated:
+        logger.warning(f"Migrated {_migrated} plaintext API key(s) to hashed storage")
+
+rate_limiter = RateLimiter()
+
+# -------------------------------------------------------------
+# Authentication
+# -------------------------------------------------------------
+# Admin token protects the dashboard data and management APIs. If it is not
+# configured, a random one is generated per process and printed once.
+ADMIN_TOKEN = os.getenv("FIREWALL_ADMIN_TOKEN", "").strip()
+if not ADMIN_TOKEN:
+    ADMIN_TOKEN = secrets.token_urlsafe(24)
+    print(f"\n[Agent Firewall] FIREWALL_ADMIN_TOKEN not set. Generated admin token for this run:\n    {ADMIN_TOKEN}\n"
+          f"Set FIREWALL_ADMIN_TOKEN in Agent_Firewall/.env to keep it stable.\n", file=sys.stderr, flush=True)
+
+
+def require_admin(x_admin_token: Optional[str] = Header(None)) -> None:
+    if not x_admin_token or not secrets.compare_digest(x_admin_token, ADMIN_TOKEN):
+        raise HTTPException(status_code=401, detail="Admin token required (X-Admin-Token header)")
+
+
+def _bearer(authorization: Optional[str]) -> Optional[str]:
+    if authorization and authorization.lower().startswith("bearer "):
+        return authorization[7:].strip() or None
+    return None
+
+
 
 app = FastAPI(
     title="Agent Firewall Security Proxy & Dashboard",
@@ -49,13 +82,16 @@ app = FastAPI(
     version="2.0.0"
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Browsers may only call the API cross-origin from explicitly configured origins.
+_cors_origins = [o.strip() for o in os.getenv("FIREWALL_CORS_ORIGINS", "").split(",") if o.strip()]
+if _cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_origins,
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "DELETE"],
+        allow_headers=["Authorization", "Content-Type", "X-Admin-Token"],
+    )
 
 
 # -------------------------------------------------------------
@@ -74,11 +110,14 @@ class CreateKeyRequest(BaseModel):
 
 
 class ChatMessage(BaseModel):
+    # Keep tool_calls / tool_call_id / name etc. so tool-calling conversations survive the proxy.
+    model_config = ConfigDict(extra="allow")
     role: str
-    content: Any
+    content: Any = None
 
 
 class ChatCompletionRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     model: Optional[str] = None
     messages: List[ChatMessage]
     temperature: Optional[float] = 0.7
@@ -86,6 +125,18 @@ class ChatCompletionRequest(BaseModel):
     stream: Optional[bool] = False
     session_id: Optional[str] = "default_session"
     tools: Optional[List[Dict[str, Any]]] = None
+    tool_choice: Optional[Any] = None
+
+
+# OpenAI parameters passed through to the upstream model unchanged.
+FORWARDED_PARAMS = ("tools", "tool_choice", "parallel_tool_calls", "top_p", "stop", "response_format",
+                    "seed", "presence_penalty", "frequency_penalty", "n", "logit_bias", "user")
+
+
+def _message_dict(m: ChatMessage) -> Dict[str, Any]:
+    d = m.model_dump(exclude_none=True)
+    d.setdefault("content", None)
+    return d
 
 
 class PlaygroundChatRequest(BaseModel):
@@ -181,7 +232,7 @@ def get_supported_models():
     return {"models": SUPPORTED_MODELS}
 
 
-@app.post("/api/keys/create")
+@app.post("/api/keys/create", dependencies=[Depends(require_admin)])
 def create_api_key(req: CreateKeyRequest, db: Session = Depends(get_db)):
     """
     Generates a virtual Firewall API Key associated with a specific model and security policy.
@@ -192,10 +243,10 @@ def create_api_key(req: CreateKeyRequest, db: Session = Depends(get_db)):
 
     key_record = ApiKeyConfig(
         key_name=req.key_name.strip() or "Default Key",
-        api_key=generated_key,
+        api_key=hash_api_key(generated_key),  # only the hash is stored
         model=req.model,
         provider=req.provider,
-        created_at=datetime.utcnow(),
+        created_at=utcnow(),
         is_active=1,
         prompt_injection_enabled=1 if req.prompt_injection_enabled else 0,
         tool_guard_enabled=1 if req.tool_guard_enabled else 0,
@@ -211,7 +262,7 @@ def create_api_key(req: CreateKeyRequest, db: Session = Depends(get_db)):
 
     return {
         "success": True,
-        "api_key": generated_key,
+        "api_key": generated_key,  # shown once; cannot be recovered later
         "key_name": key_record.key_name,
         "model": key_record.model,
         "provider": key_record.provider,
@@ -220,7 +271,7 @@ def create_api_key(req: CreateKeyRequest, db: Session = Depends(get_db)):
     }
 
 
-@app.get("/api/keys")
+@app.get("/api/keys", dependencies=[Depends(require_admin)])
 def list_api_keys(db: Session = Depends(get_db)):
     """Lists all configured virtual Firewall API keys."""
     keys = db.query(ApiKeyConfig).order_by(ApiKeyConfig.created_at.desc()).all()
@@ -229,7 +280,7 @@ def list_api_keys(db: Session = Depends(get_db)):
             {
                 "id": k.id,
                 "key_name": k.key_name,
-                "api_key": k.api_key,
+                "api_key": display_key(k.api_key),  # only the hash is stored
                 "model": k.model,
                 "provider": k.provider,
                 "created_at": k.created_at.strftime("%Y-%m-%d %H:%M") if k.created_at else "",
@@ -247,7 +298,7 @@ def list_api_keys(db: Session = Depends(get_db)):
     }
 
 
-@app.delete("/api/keys/{key_id}")
+@app.delete("/api/keys/{key_id}", dependencies=[Depends(require_admin)])
 def delete_api_key(key_id: int, db: Session = Depends(get_db)):
     """Deletes or revokes a firewall API key."""
     record = db.query(ApiKeyConfig).filter(ApiKeyConfig.id == key_id).first()
@@ -267,46 +318,70 @@ async def chat_completions(
 ):
     """
     OpenAI-compatible chat completion proxy endpoint.
-    Agents & client apps can set base_url='http://localhost:8000/api/v1' and api_key='agf-live-...'
+    Agents & client apps set base_url='http://localhost:8000/api/v1' and api_key='agf-live-...'
     """
-    firewall_key = None
-    if authorization and authorization.startswith("Bearer "):
-        firewall_key = authorization.split("Bearer ")[1].strip()
+    firewall_key = _bearer(authorization)
+    if not firewall_key:
+        raise HTTPException(status_code=401, detail="Missing firewall API key (Authorization: Bearer agf-live-...)")
+    key_record = db.query(ApiKeyConfig).filter(ApiKeyConfig.api_key == hash_api_key(firewall_key)).first()
+    if not key_record or not key_record.is_active:
+        raise HTTPException(status_code=401, detail="Invalid or inactive Firewall API Key")
+    allowed, retry_after = rate_limiter.check(f"key{key_record.id}", key_record.rate_limit_rpm or 0)
+    if not allowed:
+        raise HTTPException(status_code=429, detail=f"Rate limit of {key_record.rate_limit_rpm} requests/minute exceeded",
+                            headers={"Retry-After": str(retry_after)})
 
-    # Look up virtual key
-    target_model = req.model or "openrouter/openai/gpt-4o-mini"
-    user_id = "external_agent"
-
-    if firewall_key:
-        key_record = db.query(ApiKeyConfig).filter(ApiKeyConfig.api_key == firewall_key).first()
-        if not key_record or not key_record.is_active:
-            raise HTTPException(status_code=401, detail="Invalid or inactive Firewall API Key")
-        if not req.model:
-            target_model = key_record.model
-        user_id = key_record.key_name
-
-    messages_payload = [m.dict() for m in req.messages]
+    target_model = req.model or key_record.model
+    forwarded = {k: v for k, v in req.model_dump(exclude_none=True).items() if k in FORWARDED_PARAMS}
 
     result = firewall_engine.process_chat(
-        user_id=user_id,
-        messages=messages_payload,
+        user_id=key_record.key_name,
+        tenant_id=f"key{key_record.id}",
+        messages=[_message_dict(m) for m in req.messages],
         model=target_model,
         firewall_key=firewall_key,
         session_id=req.session_id,
         db=db,
         temperature=req.temperature,
-        max_tokens=req.max_tokens
+        max_tokens=req.max_tokens,
+        **forwarded
     )
 
     if result.get("status") == "BLOCKED":
         return JSONResponse(status_code=403, content=result)
     elif result.get("status") == "ERROR":
-        return JSONResponse(status_code=500, content=result)
+        code = 502 if str(result.get("error_type", "")).startswith("upstream") else 500
+        return JSONResponse(status_code=code, content=result)
 
+    if req.stream:
+        return StreamingResponse(_as_sse(result["response"]), media_type="text/event-stream")
     return result.get("response")
 
 
-@app.post("/api/chat/playground")
+def _as_sse(body: Dict[str, Any]):
+    """Replay a completed (already inspected) response as OpenAI-style SSE chunks.
+
+    The upstream call is not streamed: egress checks need the full reply before
+    anything reaches the client, so the client receives it in one content chunk.
+    """
+    choice = body["choices"][0]
+    msg = choice["message"]
+    delta: Dict[str, Any] = {"role": "assistant", "content": msg.get("content")}
+    if msg.get("tool_calls"):
+        delta["tool_calls"] = [{"index": i, **tc} for i, tc in enumerate(msg["tool_calls"])]
+    base = {"id": body["id"], "object": "chat.completion.chunk", "created": body["created"], "model": body["model"]}
+    chunks = [
+        {**base, "choices": [{"index": 0, "delta": delta, "finish_reason": None}]},
+        {**base, "choices": [{"index": 0, "delta": {}, "finish_reason": choice["finish_reason"]}], "usage": body.get("usage")},
+    ]
+    if body.get("firewall"):
+        chunks[-1]["firewall"] = body["firewall"]
+    for chunk in chunks:
+        yield f"data: {json.dumps(chunk)}\n\n"
+    yield "data: [DONE]\n\n"
+
+
+@app.post("/api/chat/playground", dependencies=[Depends(require_admin)])
 def playground_chat(req: PlaygroundChatRequest, db: Session = Depends(get_db)):
     """
     Interactive Chat Playground:
@@ -342,7 +417,7 @@ def playground_chat(req: PlaygroundChatRequest, db: Session = Depends(get_db)):
                 req_id=req_id,
                 user_id="playground_user",
                 model=req.model,
-                user_query=str(last_prompt),
+                user_query=str(sanitized_prompt),
                 bot_response=blocked_msg,
                 status="blocked_sensitive_data",
                 latency_ms=2.0,
@@ -396,7 +471,7 @@ def playground_chat(req: PlaygroundChatRequest, db: Session = Depends(get_db)):
     ingress_status = "PASSED"
     matched_detail = None
     if req.enable_prompt_injection:
-        inspect_res = firewall_engine.inspect_prompt(str(last_prompt))
+        inspect_res = firewall_engine.inspect_prompt(str(last_prompt), check_sensitive=False)
         if not inspect_res.is_safe:
             ingress_status = "BLOCKED"
             matched_detail = f"{inspect_res.threat_type} (Pattern: '{inspect_res.matched_pattern}')"
@@ -476,12 +551,13 @@ def playground_chat(req: PlaygroundChatRequest, db: Session = Depends(get_db)):
         api_key=req.provider_api_key,
         firewall_key=req.firewall_key,
         session_id=req.session_id,
-        db=db
+        db=db,
+        tenant_id="playground"
     )
 
     bot_reply = ""
     if chat_result.get("response") and "choices" in chat_result["response"]:
-        bot_reply = chat_result["response"]["choices"][0]["message"]["content"]
+        bot_reply = chat_result["response"]["choices"][0]["message"]["content"] or ""
     elif chat_result.get("error"):
         bot_reply = f"Error: {chat_result.get('error')}"
 
@@ -526,7 +602,7 @@ def playground_chat(req: PlaygroundChatRequest, db: Session = Depends(get_db)):
     }
 
 
-@app.post("/api/tools/simulate")
+@app.post("/api/tools/simulate", dependencies=[Depends(require_admin)])
 def simulate_tool(req: ToolSimulationRequest, db: Session = Depends(get_db)):
     """Simulates a tool call against the Dual-Gate Tool Guard."""
     res = firewall_engine.execute_tool_proxy(
@@ -539,7 +615,7 @@ def simulate_tool(req: ToolSimulationRequest, db: Session = Depends(get_db)):
     return res
 
 
-@app.get("/api/dashboard/stats")
+@app.get("/api/dashboard/stats", dependencies=[Depends(require_admin)])
 def get_dashboard_stats(db: Session = Depends(get_db)):
     """Aggregates metrics and statistics for the dashboard cards."""
     total_requests = db.query(RequestLog).count()
@@ -573,7 +649,7 @@ def get_dashboard_stats(db: Session = Depends(get_db)):
     }
 
 
-@app.get("/api/dashboard/logs")
+@app.get("/api/dashboard/logs", dependencies=[Depends(require_admin)])
 def get_dashboard_logs(limit: int = 50, db: Session = Depends(get_db)):
     """Returns chronologically ordered audit logs with tool executions."""
     logs = (

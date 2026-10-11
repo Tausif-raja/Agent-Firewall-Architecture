@@ -1,0 +1,9 @@
+fastapi>=0.110
+uvicorn>=0.29
+sqlalchemy>=2.0
+litellm>=1.40
+python-dotenv>=1.0
+# Postgres (only if DATABASE_URL points at Postgres/Supabase)
+psycopg2-binary>=2.9
+# Optional: Microsoft Presidio for PERSON/LOCATION/etc. on top of the built-in detectors
+# presidio-analyzer>=2.2

@@ -1,10 +1,15 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from sqlalchemy import Column, Integer, String, Float, DateTime, Date, Text, ForeignKey
 from sqlalchemy.orm import relationship
 try:
     from .database import Base
 except ImportError:
     from database import Base
+
+def utcnow() -> datetime:
+    """Naive UTC timestamp (datetime.utcnow() is deprecated since Python 3.12)."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
 
 class RequestLog(Base):
     __tablename__ = "request_logs"
@@ -13,7 +18,7 @@ class RequestLog(Base):
     request_id = Column(String, primary_key=True, index=True)
     user_id = Column(String, index=True)
     model = Column(String)
-    timestamp = Column(DateTime, default=datetime.utcnow)
+    timestamp = Column(DateTime, default=utcnow)
     latency_ms = Column(Float)
     status = Column(String)
     
@@ -82,7 +87,7 @@ class ToolExecutionLog(Base):
     latency_ms = Column(Float, default=0.0)
     estimated_tokens = Column(Integer, default=0)
     output_snippet = Column(Text, nullable=True)
-    timestamp = Column(DateTime, default=datetime.utcnow)
+    timestamp = Column(DateTime, default=utcnow)
 
     request_log = relationship("RequestLog", back_populates="tool_logs")
 
@@ -100,7 +105,7 @@ class ApiKeyConfig(Base):
     api_key = Column(String, unique=True, index=True, nullable=False)
     model = Column(String, nullable=False)
     provider = Column(String, default="groq")
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utcnow)
     is_active = Column(Integer, default=1)
     prompt_injection_enabled = Column(Integer, default=1)
     tool_guard_enabled = Column(Integer, default=1)

@@ -1,3 +1,4 @@
+import os
 import time
 import uuid
 from datetime import datetime
@@ -110,7 +111,7 @@ class AgentGuard:
             response = completion(
                 model=model,
                 messages=messages,
-                api_key= "***REMOVED_GROQ_KEY***",
+                api_key=os.getenv("GROQ_API_KEY"),
                 **kwargs
             )
             

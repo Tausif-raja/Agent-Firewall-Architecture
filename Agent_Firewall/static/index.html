@@ -1610,6 +1610,27 @@ print(response.choices[0].message.content)</pre>
   </div>
 
   <script>
+    // Admin auth: attach X-Admin-Token to dashboard API calls; ask for it once on 401.
+    // The token is printed in the server log at startup, or set via FIREWALL_ADMIN_TOKEN.
+    const ADMIN_TOKEN_KEY = "agf_admin_token";
+    const _nativeFetch = window.fetch.bind(window);
+    let _tokenPrompt = null;
+    function _withAdminToken(opts) {
+      const headers = Object.assign({}, (opts && opts.headers) || {});
+      headers["X-Admin-Token"] = localStorage.getItem(ADMIN_TOKEN_KEY) || "";
+      return Object.assign({}, opts || {}, { headers });
+    }
+    window.fetch = async (url, opts) => {
+      if (typeof url !== "string" || !url.startsWith("/api/")) return _nativeFetch(url, opts);
+      let res = await _nativeFetch(url, _withAdminToken(opts));
+      if (res.status === 401) {
+        _tokenPrompt = _tokenPrompt || Promise.resolve(
+          window.prompt("Agent Firewall admin token (printed in the server log, or FIREWALL_ADMIN_TOKEN):")
+        ).then(t => { if (t) localStorage.setItem(ADMIN_TOKEN_KEY, t.trim()); _tokenPrompt = null; return t; });
+        if (await _tokenPrompt) res = await _nativeFetch(url, _withAdminToken(opts));
+      }
+      return res;
+    };
     let selectedModelId = "openrouter/openai/gpt-4o-mini";
     let allLogs = [];
     let currentFilter = "all";
