@@ -1,1 +1,1 @@
-web: uvicorn Agent_Firewall.main:app --host 0.0.0.0 --port $PORT --workers 1
+web: python -m Agent_Firewall.main

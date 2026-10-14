@@ -744,4 +744,10 @@ app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("Agent_Firewall.main:app", host="0.0.0.0", port=8000, reload=True)
+    raw_port = os.environ.get("PORT", "8000")
+    try:
+        port = int(raw_port)
+    except ValueError:
+        port = 8000
+    uvicorn.run("Agent_Firewall.main:app", host="0.0.0.0", port=port, workers=1)
+
