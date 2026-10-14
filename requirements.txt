@@ -1,0 +1,8 @@
+fastapi>=0.110
+uvicorn>=0.29
+sqlalchemy>=2.0
+litellm>=1.40
+python-dotenv>=1.0
+pyyaml>=6.0
+psycopg2-binary>=2.9
+requests>=2.31
