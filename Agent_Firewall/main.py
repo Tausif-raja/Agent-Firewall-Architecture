@@ -165,6 +165,30 @@ class ToolSimulationRequest(BaseModel):
 # -------------------------------------------------------------
 SUPPORTED_MODELS = [
     {
+        "id": "groq/openai/gpt-oss-20b",
+        "name": "GPT OSS 20B",
+        "provider": "Groq",
+        "speed": "Ultra Fast (Real-Time)",
+        "pricing": "Free Tier / Ultra Low",
+        "recommended": True
+    },
+    {
+        "id": "groq/openai/gpt-oss-120b",
+        "name": "GPT OSS 120B (Reasoning)",
+        "provider": "Groq",
+        "speed": "Fast Reasoning",
+        "pricing": "Free Tier / Ultra Low",
+        "recommended": True
+    },
+    {
+        "id": "groq/qwen/qwen3.8-27b",
+        "name": "Qwen 3.8 27B",
+        "provider": "Groq",
+        "speed": "High-Throughput",
+        "pricing": "Free Tier / Ultra Low",
+        "recommended": False
+    },
+    {
         "id": "openrouter/openai/gpt-4o-mini",
         "name": "GPT-4o Mini",
         "provider": "OpenAI / OpenRouter",

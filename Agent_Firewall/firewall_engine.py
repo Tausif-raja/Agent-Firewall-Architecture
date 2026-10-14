@@ -607,15 +607,18 @@ class FirewallCoreEngine:
             effective_messages, tool_message_findings = self._screen_tool_messages(effective_messages, guard_ctx)
 
         # Step 2: Route & Execute Completion
-        call_api_key = (
-            api_key
-            or os.getenv("OPENROUTER_KEY")
-            or os.getenv("OPENROUTER_API_KEY")
-            or os.getenv("GROQ_API_KEY")
-        )
         target_model = model or "openrouter/openai/gpt-4o-mini"
         if not target_model.startswith(("openrouter/", "groq/", "openai/", "anthropic/")):
             target_model = f"openrouter/{target_model}"
+
+        if target_model.startswith("groq/"):
+            provider_env_key = os.getenv("GROQ_API_KEY")
+        elif target_model.startswith("openrouter/"):
+            provider_env_key = os.getenv("OPENROUTER_KEY") or os.getenv("OPENROUTER_API_KEY")
+        else:
+            provider_env_key = os.getenv("OPENROUTER_KEY") or os.getenv("OPENROUTER_API_KEY") or os.getenv("GROQ_API_KEY")
+
+        call_api_key = api_key or provider_env_key
 
         try:
             try:
